@@ -1,1 +1,10 @@
 .DS_Store
+/.vs
+/__pycache__
+/12.jpg
+/cam.jpg
+*.tar
+/wideresnet.py.1
+/wideresnet.py.2
+/test.jpg
+*.npy

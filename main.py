@@ -1,3 +1,4 @@
+
 # PlacesCNN to predict the scene category, attribute, and class activation map in a single pass
 # by Bolei Zhou, sep 2, 2017
 # updated, making it compatible to pytorch 1.x in a hacky way
@@ -11,7 +12,10 @@ import os
 import numpy as np
 import cv2
 from PIL import Image
-import sys
+
+import argparse
+from tqdm import tqdm
+import json
 
  # hacky way to deal with the Pytorch 1.0 update
 def recursion_change_bn(module):
@@ -25,14 +29,14 @@ def recursion_change_bn(module):
 def load_labels():
     # prepare all the labels
     # scene category relevant
-    file_name_category = 'categories_places365.txt'
+    file_name_category = 'categories_places365_renamed.txt'
     if not os.access(file_name_category, os.W_OK):
         synset_url = 'https://raw.githubusercontent.com/csailvision/places365/master/categories_places365.txt'
         os.system('wget ' + synset_url)
     classes = list()
     with open(file_name_category) as class_file:
         for line in class_file:
-            classes.append(line.strip().split(' ')[0][3:])
+            classes.append(line.strip())
     classes = tuple(classes)
 
     # indoor and outdoor relevant
@@ -65,6 +69,7 @@ def load_labels():
     return classes, labels_IO, labels_attribute, W_attribute
 
 def hook_feature(module, input, output):
+    global features_blobs
     features_blobs.append(np.squeeze(output.data.cpu().numpy()))
 
 def returnCAM(feature_conv, weight_softmax, class_idx):
@@ -130,66 +135,148 @@ def load_model():
         model._modules.get(name).register_forward_hook(hook_feature)
     return model
 
+def main(args):
 
-# load the labels
-classes, labels_IO, labels_attribute, W_attribute = load_labels()
+    # load the labels
+    classes, labels_IO, labels_attribute, W_attribute = load_labels()
 
-# load the model
-features_blobs = []
-model = load_model()
+    # load the model
+    global features_blobs
+    features_blobs = []
+    model = load_model()
 
-# load the transformer
-tf = returnTF() # image transformer
+    # load the transformer
+    tf = returnTF() # image transformer
 
-# get the softmax weight
-params = list(model.parameters())
-weight_softmax = params[-2].data.numpy()
-weight_softmax[weight_softmax<0] = 0
+    # get the softmax weight
+    params = list(model.parameters())
+    weight_softmax = params[-2].data.numpy()
+    weight_softmax[weight_softmax<0] = 0
+    
+    images = {}
+    stats = {}
+    n = 0
 
-# load the test image
-#img_url = 'http://places.csail.mit.edu/demo/6.jpg'
-#os.system('wget %s -q -O test.jpg' % img_url)
+    dirs = os.listdir(args.data_dir)
+    for dir in tqdm(dirs):
+        files_dir = os.path.join(args.data_dir, dir)
 
-img_url = sys.argv[1]
+        if (not os.path.isdir(files_dir)):
+            continue
 
-img = Image.open(img_url)
-input_img = V(tf(img).unsqueeze(0))
+        files = os.listdir(files_dir)
+        files = [file for file in files if "_mask" not in file]
 
-# forward pass
-logit = model.forward(input_img)
-h_x = F.softmax(logit, 1).data.squeeze()
-probs, idx = h_x.sort(0, True)
-probs = probs.numpy()
-idx = idx.numpy()
+        for file in tqdm(files):
 
-print('RESULT ON ' + img_url)
+            # load the test image
+            filename = os.path.join(args.data_dir, dir, file)
 
-# output the IO prediction
-io_image = np.mean(labels_IO[idx[:10]]) # vote for the indoor or outdoor
-if io_image < 0.5:
-    print('--TYPE OF ENVIRONMENT: indoor')
-else:
-    print('--TYPE OF ENVIRONMENT: outdoor')
+            if (args.use_masks):
 
-# output the prediction of scene category
-print('--SCENE CATEGORIES:')
-for i in range(0, 5):
-    print('{:.3f} -> {}'.format(probs[i], classes[idx[i]]))
+                filename_mask = os.path.join(args.data_dir, dir, file.replace(".jpg", "_mask.jpg"))
 
-# output the scene attributes
-responses_attribute = W_attribute.dot(features_blobs[1])
-idx_a = np.argsort(responses_attribute)
-print('--SCENE ATTRIBUTES:')
-print(', '.join([labels_attribute[idx_a[i]] for i in range(-1,-10,-1)]))
+                if (not os.path.exists(filename_mask)):
+                    continue
 
+                img = cv2.imread(filename).astype('float32')
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                mask = cv2.imread(filename_mask).astype('float32')/255
+                img = img*mask
 
-# generate class activation mapping
-print('Class activation map is saved as cam.jpg')
-CAMs = returnCAM(features_blobs[0], weight_softmax, [idx[0]])
+                #img = cv2.imread(filename)
+                #img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                #mask = cv2.imread(filename_mask)
+                #img = cv2.inpaint(img,255-mask[:,:,1],3,cv2.INPAINT_TELEA)
 
-# render the CAM and output
-img = cv2.imread(img_url)
-height, width, _ = img.shape
-heatmap = cv2.applyColorMap(cv2.resize(CAMs[0],(width, height)), cv2.COLORMAP_JET)
-result = heatmap * 0.4 + img * 0.5
-cv2.imwrite('cam.jpg', result)
+                img = Image.fromarray(img.astype('uint8'))
+            else:
+                img = Image.open(filename)
+
+            input_img = V(tf(img).unsqueeze(0))
+            
+            ann = {}
+
+            # forward pass
+            logit = model.forward(input_img)
+            h_x = F.softmax(logit, 1).data.squeeze()
+            probs, idx = h_x.sort(0, True)
+            probs = probs.numpy()
+            idx = idx.numpy()
+
+            #print('RESULT ON ' + img_name)
+
+            # output the IO prediction
+            io_image = np.mean(labels_IO[idx[:10]]) # vote for the indoor or outdoor
+            ann["outdoor"] = io_image
+
+            # output the prediction of scene category
+            scene_categories = []
+            for i in range(0, 5):
+                cls = classes[idx[i]]
+                prob = probs[i]
+
+                if (prob < .05):
+                    continue
+
+                scene_categories.append((cls, str(prob)))
+
+                if (cls in stats):
+                    stats[cls] += prob
+                else:
+                    stats[cls] = prob
+
+            ann["scene_categories"] = scene_categories
+
+            # output the scene attributes
+            scene_attributes = []
+            responses_attribute = W_attribute.dot(features_blobs[1])
+            idx_a = np.argsort(responses_attribute)
+            scene_attributes = [labels_attribute[idx_a[i]] for i in range(-1,-10,-1)]
+
+            ann["scene_attributes"] = scene_attributes
+
+            images[os.path.join(dir, file)] = ann
+
+            n +=1
+
+            #if (n > 100):
+            #    break
+
+    sum_prob = 0
+    for cls in stats.keys():
+        sum_prob += stats[cls]
+
+    for cls in stats.keys():
+        stats[cls] /= sum_prob
+
+    stats_list = []
+    for cls in stats.keys():
+        prob = stats[cls]
+        if (prob < .05):
+            continue
+
+        stats_list.append((prob, cls))
+
+    stats_list.sort(reverse=True)
+
+    for cls in stats.keys():
+        stats[cls] = str(stats[cls])
+
+    images["stats"] = stats
+
+    print(stats_list)
+
+    output_file_path = os.path.join(args.data_dir, "scene_annotations.json")
+    with open(output_file_path, 'w+') as json_file:
+        json_file.write(json.dumps(images))
+
+parser = argparse.ArgumentParser(description='Places 365 inference')
+#parser.add_argument('--data_dir', metavar='DIR', default="E:/Research/Images/FineGrained/fgvc-aircraft-2013b/test", help='path to dataset')
+parser.add_argument('data_dir', metavar='DIR', help='path to dataset')
+parser.add_argument('--use_masks', action="store_true")
+
+if __name__ == "__main__":
+    # Parses command line and config file arguments.
+    args = parser.parse_args()
+    main(args)
